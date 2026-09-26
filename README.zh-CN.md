@@ -54,6 +54,13 @@ Qwen 27B 服务。18 条路线已经完成启动和参考负载审计；存在�
 
 Launcher 支持 TP、PP 及 TP/PP 混合推理；当前主要布局为双 RTX 2080 Ti（TP=2）和四张 Tesla T10（TP=4）。
 
+## 🧯 WSL2 长上下文故障复盘
+
+在 WSL2 + 双 RTX 2080 Ti 22 GB + NVLink 上部署 262K 长上下文时，曾遇到
+Windows host commit 耗尽、DXG allocation 失败以及 NVLink/TDR 等互相独立的故障链。
+复现条件、排障顺序、失败方案和最终稳定化设计见
+[WSL2 长上下文踩坑与故障复盘](docs/WSL2-2080Ti-long-context-postmortem.zh-CN.md)。
+
 ## 🧪 已验证模型路线
 
 当前实测模型和权重路线：

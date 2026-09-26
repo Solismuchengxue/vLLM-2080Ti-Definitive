@@ -92,6 +92,11 @@ from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
 )
+from vllm.v1.worker.early_kv_arena import (
+    exclude_from_profile as early_kv_arena_exclude_from_profile,
+    reserve as early_kv_arena_reserve,
+    rewind as early_kv_arena_rewind,
+)
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -339,6 +344,14 @@ class Worker(WorkerBase):
             yield
             return
 
+        # WSL GPU-PV/DXG can fail create_allocation with EOVERFLOW even
+        # while substantial VRAM remains free. A very small max_split_size
+        # deliberately increases cudaMalloc traffic, which amplifies that
+        # failure mode. Keep PyTorch's normal allocator policy on WSL.
+        if os.environ.get("WSL_DISTRO_NAME"):
+            yield
+            return
+
         conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
         match = re.search(r"max_split_size_mb:(\d+)", conf)
         original_value = match.group(1) if match else None
@@ -452,6 +465,8 @@ class Worker(WorkerBase):
             logger.debug(
                 "worker requested memory: %sGiB", format_gib(self.requested_memory)
             )
+            # SOLIS_WSL_EARLY_KV_POC_V1: reserve after CUDA/NCCL init, before model load.
+            self._solis_early_kv_arena = early_kv_arena_reserve(self.device)
         else:
             raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
 
@@ -583,6 +598,9 @@ class Worker(WorkerBase):
             reserve_flashinfer_workspace_for_profiling(self.vllm_config, self.device)
             self.model_runner.profile_run()
 
+        # SOLIS_WSL_EARLY_KV_POC_V1: arena is KV backing, not non-KV consumption.
+        early_kv_arena_exclude_from_profile(profile_result)
+
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
         # torch.accelerator.get_memory_info (reliable on ROCm, as used by
@@ -595,6 +613,9 @@ class Worker(WorkerBase):
             and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+
+        # SOLIS_WSL_EARLY_KV_POC_V1: profiling KV is torn down; final KV may reuse offset zero.
+        early_kv_arena_rewind(self.device)
 
         # Respect the opt-in flag as originally designed.
         cudagraph_memory_estimate_applied = (

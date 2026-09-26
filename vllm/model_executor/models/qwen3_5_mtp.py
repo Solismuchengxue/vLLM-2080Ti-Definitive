@@ -83,10 +83,10 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
 
-        self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
-        )
+        # Solis/WSL2: Qwen3.5 MTP checkpoint has no private embed_tokens.
+        # load_eagle_model() shares the target embedding after draft loading,
+        # so avoid a temporary ~vocab-sized GPU allocation here.
+        self.embed_tokens = PPMissingLayer()
 
         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
         # missing from hf_quant_config.json exclude_modules. Force unquantized.
@@ -255,17 +255,10 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
         )
 
-        if get_pp_group().is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=self.quant_config,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
-            if config.tie_word_embeddings:
-                self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
-        else:
-            self.lm_head = PPMissingLayer()
+        # Solis/WSL2: this MTP checkpoint has no private lm_head.
+        # load_eagle_model() replaces it with the target lm_head immediately
+        # after draft loading, so do not allocate a temporary copy here.
+        self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (

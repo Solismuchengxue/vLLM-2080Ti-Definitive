@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import math
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import product as iprod
 from typing import Any
 
@@ -40,6 +41,14 @@ from vllm.v1.kv_cache_interface import (
     create_kv_cache_views,
 )
 from vllm.v1.worker.block_table import get_block_table_width
+from vllm.v1.worker.early_kv_arena import (
+    EarlyKVArenaExhausted,
+    enabled as early_kv_arena_enabled,
+    num_device_alloc as early_kv_num_device_alloc,
+    strict_mode as early_kv_arena_strict,
+    take as early_kv_arena_take,
+    verify_no_device_alloc as early_kv_verify_no_device_alloc,
+)
 
 logger = init_logger(__name__)
 
@@ -437,6 +446,218 @@ def allocate_kv_cache(
     if not kv_cache_config.kv_cache_tensors:
         return {}
 
+    # SOLIS_WSL_EARLY_KV_POC_V1: all raw KV backing comes from the pre-reserved arena.
+    _solis_early = early_kv_arena_enabled()
+    _solis_alloc_before = (
+        early_kv_num_device_alloc(device) if _solis_early else None
+    )
+
+    def _solis_alloc_backing(size: int) -> torch.Tensor:
+        if not _solis_early:
+            return torch.zeros(
+                size,
+                dtype=torch.int8,
+                device=device,
+            )
+
+        try:
+            return early_kv_arena_take(
+                size,
+                device,
+                zero=True,
+            )
+        except EarlyKVArenaExhausted:
+            if early_kv_arena_strict():
+                raise
+
+            logger.warning(
+                "WSL Early KV Arena exhausted; "
+                "falling back to late CUDA allocation"
+            )
+
+            return torch.zeros(
+                size,
+                dtype=torch.int8,
+                device=device,
+            )
+
+    def _solis_finish(
+        result: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        if _solis_alloc_before is not None:
+            early_kv_verify_no_device_alloc(
+                device,
+                _solis_alloc_before,
+            )
+        return result
+
+    # WSL/DXG-safe slab allocator for DFlash2 independent pools.
+    #
+    # One CUDA allocation per layer creates dozens of DXG allocation
+    # transactions on Qwen3.8 + DFlash2 and can hit WSL GPU-PV EOVERFLOW
+    # even with several GiB of VRAM free. Pack consecutive layer regions
+    # into a small number of bounded backing slabs instead.
+    #
+    # Scheduler block pools remain independent; this changes only physical
+    # backing placement. KVBlockZeroer already supports segments living in
+    # different CUDA allocations.
+    if (
+        os.environ.get("WSL_DISTRO_NAME")
+        and kv_cache_config.independent_block_pools
+    ):
+        slab_limit_mb = int(
+            os.environ.get("VLLM_WSL_DXG_KV_SLAB_MB", "2048")
+        )
+        if slab_limit_mb < 256:
+            raise ValueError(
+                "VLLM_WSL_DXG_KV_SLAB_MB must be >= 256"
+            )
+        slab_limit = slab_limit_mb * 1024 * 1024
+
+        entries = []
+
+        for tensor in kv_cache_config.kv_cache_tensors:
+            if len(tensor.layers) != 1:
+                raise ValueError(
+                    "WSL DFlash2 slab allocation expects one layer "
+                    "per KVCacheTensor."
+                )
+
+            layer_name = tensor.layers[0]
+
+            group_id, group = next(
+                (group_id, group)
+                for group_id, group
+                in enumerate(kv_cache_config.kv_cache_groups)
+                if layer_name in group.layer_names
+            )
+
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.kv_cache_specs[layer_name]
+
+            num_blocks = kv_cache_config.num_blocks_of(tensor)
+            region_size = spec.page_size_bytes * num_blocks
+
+            entries.append(
+                (
+                    tensor,
+                    layer_name,
+                    group_id,
+                    spec,
+                    num_blocks,
+                    region_size,
+                )
+            )
+
+        # Pack complete layer regions into bounded slabs. Never split a
+        # layer region across CUDA allocations.
+        slabs = []
+        current = []
+        current_size = 0
+
+        for entry in entries:
+            region_size = entry[5]
+
+            if (
+                current
+                and current_size + region_size > slab_limit
+            ):
+                slabs.append((current, current_size))
+                current = []
+                current_size = 0
+
+            local_offset = current_size
+            current.append((*entry, local_offset))
+            current_size += region_size
+
+        if current:
+            slabs.append((current, current_size))
+
+        logger.info(
+            "WSL/DXG-safe slab allocator: %d KV regions -> %d CUDA slabs "
+            "(limit=%d MiB, total=%.2f MiB)",
+            len(entries),
+            len(slabs),
+            slab_limit_mb,
+            sum(size for _, size in slabs) / (1024 * 1024),
+        )
+
+        kv_caches: dict[str, torch.Tensor] = {}
+
+        # Allocate largest slabs first so large contiguous requests happen
+        # before the allocator accumulates more small segments.
+        ordered_slabs = sorted(
+            enumerate(slabs),
+            key=lambda item: item[1][1],
+            reverse=True,
+        )
+
+        for slab_id, (slab_entries, slab_size) in ordered_slabs:
+            logger.info(
+                "Allocating WSL/DXG KV slab %d/%d: %.2f MiB, %d regions",
+                slab_id + 1,
+                len(slabs),
+                slab_size / (1024 * 1024),
+                len(slab_entries),
+            )
+
+            buf = _solis_alloc_backing(slab_size)
+
+            for (
+                tensor,
+                layer_name,
+                group_id,
+                spec,
+                num_blocks,
+                region_size,
+                local_offset,
+            ) in slab_entries:
+
+                if not spec.has_layer_views:
+                    kv_caches[layer_name] = buf.narrow(
+                        0,
+                        local_offset,
+                        region_size,
+                    )
+                    continue
+
+                kernel_block_size = None
+                if (
+                    kernel_block_sizes is not None
+                    and group_id < len(kernel_block_sizes)
+                ):
+                    kernel_block_size = kernel_block_sizes[group_id]
+
+                if (
+                    isinstance(spec, MLAAttentionSpec)
+                    and spec.storage_block_size is not None
+                ):
+                    kernel_block_size = spec.storage_block_size
+
+                local_tensor = replace(
+                    tensor,
+                    size=slab_size,
+                    offset=local_offset,
+                    layer_stride=spec.page_size_bytes,
+                    block_stride=spec.page_size_bytes,
+                )
+
+                views = create_kv_cache_views(
+                    buf,
+                    spec,
+                    num_blocks,
+                    layout,
+                    local_tensor,
+                    kernel_block_size=kernel_block_size,
+                )
+
+                kv_caches.update(
+                    zip(local_tensor.layers, views)
+                )
+
+        return _solis_finish(kv_caches)
+
     sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
     assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
     raw_size = sizes.pop()
@@ -454,7 +675,7 @@ def allocate_kv_cache(
         buf_size = ((raw_size + page_size - 1) // page_size) * page_size
     else:
         buf_size = raw_size
-    buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
+    buf = _solis_alloc_backing(buf_size)
 
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:
@@ -488,7 +709,7 @@ def allocate_kv_cache(
             kernel_block_size=kernel_block_size,
         )
         kv_caches.update(zip(tensor.layers, views))
-    return kv_caches
+    return _solis_finish(kv_caches)
 
 
 def prepare_kernel_block_sizes(

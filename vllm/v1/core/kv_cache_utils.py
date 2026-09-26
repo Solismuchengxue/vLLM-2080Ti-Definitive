@@ -1189,7 +1189,49 @@ def _dflash_group_capacities(
         )
 
     usable_memory = available_memory - null_bytes
-    if required_bytes:
+    if os.environ.get("WSL_DISTRO_NAME"):
+        # WSL GPU-PV/DXG is sensitive to additional large CUDA allocations.
+        # Do not inflate DFlash2's independent pools merely to consume all
+        # available KV budget. Allocate exactly the request minimum plus each
+        # pool's required null block. This preserves max_model_len while
+        # reducing individual CUDA backing allocations.
+        capacities = [req + 1 if req else 1 for req in requirements]
+        planned_bytes = sum(
+            cap * page for cap, page in zip(capacities, page_bytes)
+        )
+        # SOLIS_WSL_EARLY_KV_POC_V1: fail early if DFlash2 plan cannot fit the arena.
+        arena_gib = float(
+            os.environ.get("VLLM_WSL_EARLY_KV_GIB", "5.0")
+        )
+
+        if arena_gib > 0:
+            arena_bytes = int(arena_gib * (1 << 30))
+
+            if planned_bytes > arena_bytes:
+                msg = (
+                    "WSL Early KV Arena is smaller than "
+                    "the planned KV backing: "
+                    f"planned={format_gib(planned_bytes)} GiB, "
+                    f"arena={arena_gib:.2f} GiB"
+                )
+
+                strict = os.environ.get(
+                    "VLLM_WSL_EARLY_KV_STRICT",
+                    "1",
+                ).lower()
+
+                if strict in {"1", "true", "yes", "on"}:
+                    raise ValueError(msg)
+
+                logger.warning(msg)
+
+        logger.info(
+            "WSL/DXG-safe DFlash2 KV plan: minimum pool capacities, "
+            "%s planned from %s available.",
+            format_gib(planned_bytes),
+            format_gib(available_memory),
+        )
+    elif required_bytes:
         capacities = [
             max(req, (req * usable_memory) // required_bytes) + 1
             if req

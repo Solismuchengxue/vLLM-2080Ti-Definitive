@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Rotary Positional Embeddings Base Class."""
 
+import os
+
 import torch
 
 from vllm._aiter_ops import rocm_aiter_ops
@@ -93,6 +95,34 @@ class RotaryEmbeddingBase(CustomOp):
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         """Compute the cos and sin cache."""
+        if (
+            os.environ.get("WSL_DISTRO_NAME")
+            and self.max_position_embeddings >= 131072
+        ):
+            target_device = torch.get_default_device()
+            inv_freq = 1.0 / (
+                self.base
+                ** (
+                    torch.arange(
+                        0,
+                        self.rotary_dim,
+                        2,
+                        dtype=torch.float,
+                        device="cpu",
+                    )
+                    / self.rotary_dim
+                )
+            )
+            t = torch.arange(
+                self.max_position_embeddings,
+                dtype=torch.float,
+                device="cpu",
+            )
+            freqs = torch.einsum("i,j -> ij", t, inv_freq)
+            cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1)
+            cache = cache.to(self.dtype)
+            return cache.to(device=target_device)
+
         inv_freq = self._compute_inv_freq(self.base)
         t = torch.arange(self.max_position_embeddings, dtype=torch.float)
 

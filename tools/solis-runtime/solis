@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
+REPO="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+API="http://127.0.0.1:8000"
+PWSH="/mnt/c/Program Files/PowerShell/7/pwsh.exe"
+
+cd "$REPO"
+
+apply_solis_power_cap() {
+    echo
+    echo "=== SOLIS AI GPU POWER CAP ==="
+
+    if ! "$REPO/tools/solis-runtime/apply-power-cap-180.sh"; then
+        echo "SOLIS_POWER_CAP=FAIL" >&2
+        return 1
+    fi
+}
+
+echo "============================================================"
+echo " Solis 2x2080Ti / Qwen3.8-27B / 262K"
+echo "============================================================"
+
+# ------------------------------------------------------------
+# 0. Already running?
+# ------------------------------------------------------------
+
+if curl -fsS --max-time 2 "$API/health" >/dev/null 2>&1; then
+    echo
+    echo "Service already running."
+    echo "HEALTH=HTTP_200"
+    echo
+
+    ./tools/solis-preflight/check_nvlink.sh
+
+    apply_solis_power_cap
+
+    echo
+    echo "SOLIS_STATUS=ALREADY_RUNNING"
+    exit 0
+fi
+
+# ------------------------------------------------------------
+# 1. Windows host commit/pagefile preflight
+# ------------------------------------------------------------
+
+echo
+echo "=== WINDOWS HOST PREFLIGHT ==="
+
+if [[ ! -x "$PWSH" ]]; then
+    echo "ERROR: Windows PowerShell 7 not found:"
+    echo "  $PWSH"
+    exit 1
+fi
+
+HOST_PREFLIGHT_WIN=$(
+    wslpath -w \
+        "$REPO/tools/windows/Test-SolisHostPreflight.ps1"
+)
+
+"$PWSH" \
+    -NoProfile \
+    -ExecutionPolicy Bypass \
+    -File "$HOST_PREFLIGHT_WIN"
+
+echo
+echo "HOST PREFLIGHT PASSED"
+
+# ------------------------------------------------------------
+# 2. Physical NVLink gate
+# ------------------------------------------------------------
+
+echo
+echo "=== NVLINK PREFLIGHT ==="
+
+./tools/solis-preflight/check_nvlink.sh
+
+echo
+echo "NVLINK PREFLIGHT PASSED"
+
+# ------------------------------------------------------------
+# 3. Solis AI GPU power cap
+# ------------------------------------------------------------
+
+apply_solis_power_cap
+
+# ------------------------------------------------------------
+# 4. vm.overcommit_memory
+#
+# launcher non-interactive mode cannot ask for sudo.
+# Set it here, remember the original value, restore after startup.
+# ------------------------------------------------------------
+
+ORIGINAL_OVERCOMMIT=$(cat /proc/sys/vm/overcommit_memory)
+OVERCOMMIT_CHANGED=0
+
+restore_overcommit() {
+    if (( OVERCOMMIT_CHANGED )); then
+        echo
+        echo "Restoring vm.overcommit_memory=$ORIGINAL_OVERCOMMIT ..."
+        sudo -n /usr/local/sbin/solis-overcommit \
+            "$ORIGINAL_OVERCOMMIT" || true
+    fi
+}
+
+trap restore_overcommit EXIT INT TERM
+
+if [[ "$ORIGINAL_OVERCOMMIT" != "1" ]]; then
+    echo
+    echo "=== TEMPORARY OVERCOMMIT ==="
+
+    sudo -n /usr/local/sbin/solis-overcommit 1
+    OVERCOMMIT_CHANGED=1
+
+    echo "vm.overcommit_memory=1"
+fi
+
+# ------------------------------------------------------------
+# 5. Known-good runtime environment
+# ------------------------------------------------------------
+
+unset PYTORCH_ALLOC_CONF
+unset PYTORCH_CUDA_ALLOC_CONF
+unset KV_CACHE_MEMORY_BYTES
+
+export VLLM_WSL_EARLY_KV_GIB=5.0
+export VLLM_WSL_EARLY_KV_STRICT=1
+export VLLM_WSL_DXG_KV_SLAB_MB=2048
+
+export VLLM_WSL2_ENABLE_PIN_MEMORY=1
+export CUSTOM_ALL_REDUCE_MODE=off
+export SPECULATIVE_MODEL=/home/smile/models/Qwen3.8-27B-DFlash2
+
+# ------------------------------------------------------------
+# 6. Start validated 262K route
+#
+# NON_INTERACTIVE=1 is enforced by launcher is_tty():
+# - no menu
+# - no startup performance benchmark question
+# - startup health + smoke still run
+# stdin remains /dev/null as an additional input guard.
+# ------------------------------------------------------------
+
+echo
+echo "=== STARTING VLLM ==="
+
+NON_INTERACTIVE=1 \
+./launcher.sh \
+  --model-dir /home/smile/models/Qwen3.8-27B-NVFP4 \
+  --profile 2x2080Ti/qwen27b/w4a16/dflash2-fp8kv-1x262K-text-image.env \
+  --mode fast \
+  --service-scope lan \
+  --gpu-devices 0,1 \
+  --tp-size 2 \
+  --pp-size 1 \
+  --gpu-util 0.938 \
+  --message-type text+image \
+  --set ENABLE_AUTO_TOOL_CHOICE=1 \
+  --set TOOL_CALL_PARSER=qwen3_xml \
+  --set LANGUAGE_MODEL_ONLY=0 \
+  --set SKIP_MM_PROFILING=1 \
+  --set MM_IMAGE_LIMIT=64 \
+  --set MM_LIMIT_JSON='{"image":64,"video":0,"audio":0}' \
+  </dev/null
+
+# ------------------------------------------------------------
+# 7. Final health
+# ------------------------------------------------------------
+
+echo
+echo "=== FINAL HEALTH ==="
+
+HTTP_CODE=$(
+    curl -sS \
+        -o /dev/null \
+        -w '%{http_code}' \
+        "$API/health"
+)
+
+echo "HEALTH=HTTP_$HTTP_CODE"
+
+if [[ "$HTTP_CODE" != "200" ]]; then
+    echo "SOLIS_START=FAIL"
+    exit 1
+fi
+
+echo
+echo "SOLIS_START=PASS"

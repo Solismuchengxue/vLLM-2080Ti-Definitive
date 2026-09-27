@@ -289,6 +289,7 @@ die() {
 }
 
 is_tty() {
+  [[ "${NON_INTERACTIVE:-0}" != "1" ]] || return 1
   [[ -t 0 && -t 1 ]] || { : </dev/tty >/dev/tty; } 2>/dev/null
 }
 

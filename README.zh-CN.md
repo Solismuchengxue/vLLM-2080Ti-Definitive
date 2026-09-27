@@ -61,6 +61,11 @@ Windows host commit 耗尽、DXG allocation 失败以及 NVLink/TDR 等互相独
 复现条件、排障顺序、失败方案和最终稳定化设计见
 [WSL2 长上下文踩坑与故障复盘](docs/WSL2-2080Ti-long-context-postmortem.zh-CN.md)。
 
+在 HP Z6 G4 / WSL2 / 双 RTX 2080 Ti 22 GB + NVLink 上验证的一键
+`solis` 启动、固定 180 W / 180 W AI 功耗门禁、非交互 launcher 和
+262K Qwen3.8 路线证据见
+[Solis 双 RTX 2080 Ti / Qwen3.8 27B / 262K 运行封板](docs/Solis-2x2080Ti-262K-runtime.zh-CN.md)。
+
 ## 🧪 已验证模型路线
 
 当前实测模型和权重路线：

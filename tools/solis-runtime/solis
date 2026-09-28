@@ -19,6 +19,21 @@ apply_solis_power_cap() {
     fi
 }
 
+start_solis_dsh() {
+    echo
+    echo "=== SOLIS DSH ==="
+
+    if "$REPO/tools/solis-runtime/start-dsh.sh"; then
+        echo "SOLIS_DSH=PASS"
+        return 0
+    fi
+
+    # DSH is an upper-layer UI/agent surface. Its failure must not
+    # invalidate an otherwise healthy vLLM inference service.
+    echo "SOLIS_DSH=WARN" >&2
+    return 0
+}
+
 echo "============================================================"
 echo " Solis 2x2080Ti / Qwen3.8-27B / 262K"
 echo "============================================================"
@@ -36,6 +51,8 @@ if curl -fsS --max-time 2 "$API/health" >/dev/null 2>&1; then
     ./tools/solis-preflight/check_nvlink.sh
 
     apply_solis_power_cap
+
+    start_solis_dsh
 
     echo
     echo "SOLIS_STATUS=ALREADY_RUNNING"
@@ -181,6 +198,8 @@ if [[ "$HTTP_CODE" != "200" ]]; then
     echo "SOLIS_START=FAIL"
     exit 1
 fi
+
+start_solis_dsh
 
 echo
 echo "SOLIS_START=PASS"
